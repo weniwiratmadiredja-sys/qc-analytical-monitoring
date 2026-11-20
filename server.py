@@ -47,7 +47,7 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   with connect() as c:
    u=self.user(c)
-   if self.path=='/': return self.respond(200,(BASE/'index.html').read_text() if u else LOGIN,'text/html; charset=utf-8')
+   if self.path.split('?')[0] in ('/', '/login', '/index.html'):return self.respond(200,(BASE/'index.html').read_text() if u else LOGIN,'text/html; charset=utf-8')
    if self.path=='/health':return self.respond(200,{'status':'ok'})
    if not u:return self.respond(401,{'error':'Sign in required'})
    if self.path=='/api/users':
