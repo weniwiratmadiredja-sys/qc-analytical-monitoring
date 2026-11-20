@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: qc-analytical-monitoring-trial
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: QC_ADMIN_PASSWORD
+        sync: false
+      - key: QC_ADMIN2_PASSWORD
+        sync: false
+      - key: QC_HTTPS
+        value: '1'
