@@ -21,7 +21,9 @@ def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def password(p,s): return hashlib.pbkdf2_hmac('sha256',p.encode(),bytes.fromhex(s),300000).hex()
 def init():
  with connect() as c:
-  c.execute("""CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager','team')), active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)))""")
+  c.execute("""CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','manager','section','team')), active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)))""")
+  c.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check")
+  c.execute("ALTER TABLE users ADD CONSTRAINT users_role_check CHECK(role IN ('admin','manager','section','team'))")
   c.execute("CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, username TEXT REFERENCES users, expires DOUBLE PRECISION)")
   c.execute("CREATE TABLE IF NOT EXISTS inspections(id TEXT PRIMARY KEY, owner TEXT REFERENCES users, version INTEGER NOT NULL, payload TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
   c.execute("CREATE TABLE IF NOT EXISTS audit(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, at TEXT, actor TEXT, action TEXT, record_id TEXT, before_value TEXT, after_value TEXT, reason TEXT)")
@@ -47,14 +49,14 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   with connect() as c:
    u=self.user(c)
-   if self.path.split('?')[0] in ('/', '/login', '/index.html'):return self.respond(200,(BASE/'index.html').read_text() if u else LOGIN,'text/html; charset=utf-8')
+   if self.path.split('?')[0] in ('/', '/login', '/index.html'): return self.respond(200,(BASE/'index.html').read_text() if u else LOGIN,'text/html; charset=utf-8')
    if self.path=='/health':return self.respond(200,{'status':'ok'})
    if not u:return self.respond(401,{'error':'Sign in required'})
    if self.path=='/api/users':
-    if u['role']!='admin':return self.respond(403,{'error':'Admin only'})
-    return self.respond(200,[dict(r) for r in c.execute('SELECT username,role,active FROM users ORDER BY username')])
+    if u['role'] not in ('admin','manager'):return self.respond(403,{'error':'Manager or admin only'})
+    return self.respond(200,[dict(r) for r in c.execute('SELECT username,role,active FROM users ORDER BY username' if u['role']=='admin' else "SELECT username,role,active FROM users WHERE role IN ('team','section') ORDER BY username")])
    if self.path=='/api/records':
-    rows=c.execute('SELECT * FROM inspections WHERE deleted=0 ORDER BY created_at, id').fetchall(); return self.respond(200,{'role':u['role'],'username':u['username'],'records':[dict(json.loads(r['payload']),version=r['version']) for r in rows]})
+    rows=c.execute('SELECT * FROM inspections WHERE deleted=0 ORDER BY created_at, id').fetchall(); return self.respond(200,{'role':u['role'],'username':u['username'],'records':[dict(json.loads(r['payload']),version=r['version'],owner=r['owner']) for r in rows]})
    if self.path=='/api/audit' and u['role']!='team':return self.respond(200,[dict(r) for r in c.execute('SELECT * FROM audit ORDER BY id DESC')])
    return self.respond(404,{'error':'Not found'})
  def do_POST(self):
@@ -64,7 +66,7 @@ class Handler(BaseHTTPRequestHandler):
    with connect() as c:
     if self.path=='/login':
      from urllib.parse import parse_qs
-     form=parse_qs(raw.decode()); name=form.get('username',[''])[0]; p=form.get('password',[''])[0]; u=c.execute('SELECT * FROM users WHERE username=?',(name,)).fetchone()
+     form=parse_qs(raw.decode()); name=form.get('username',[''])[0].strip().lower(); p=form.get('password',[''])[0]; u=c.execute('SELECT * FROM users WHERE username=?',(name,)).fetchone()
      if not u or not u['active'] or not hmac.compare_digest(u['hash'],password(p,u['salt'])):return self.respond(403,'Invalid login. Return to / and retry.','text/plain')
      t=secrets.token_urlsafe(40); c.execute('INSERT INTO sessions VALUES(?,?,?)',(t,name,datetime.datetime.now().timestamp()+28800)); c.commit(); return self.respond(303,'','text/plain',{'Location':'/','Set-Cookie':f'qc_session={t}; HttpOnly; SameSite=Strict; Path=/'+('; Secure' if os.getenv('QC_HTTPS')=='1' else '')})
     u=self.user(c)
@@ -76,18 +78,19 @@ class Handler(BaseHTTPRequestHandler):
     if self.path=='/api/logout':
      t=SimpleCookie(self.headers.get('Cookie',''))['qc_session'].value; c.execute('DELETE FROM sessions WHERE token=?',(t,)); c.commit(); return self.respond(200,{'ok':True},headers={'Set-Cookie':'qc_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict'})
     if self.path=='/api/users':
-     if u['role']!='admin':return self.respond(403,{'error':'Admin only'})
-     name=d.get('username',''); action=d.get('action'); reason=str(d.get('reason','')).strip(); role=d.get('role'); pw=d.get('password','')
+     if u['role'] not in ('admin','manager'):return self.respond(403,{'error':'Manager or admin only'})
+     name=str(d.get('username','')).strip().lower(); action=d.get('action'); reason=str(d.get('reason','')).strip(); role=d.get('role'); pw=d.get('password','')
      if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9_.@+-]{3,254}',name) or not reason:return self.respond(400,{'error':'Valid username and reason required'})
      before=c.execute('SELECT username,role,active FROM users WHERE username=?',(name,)).fetchone()
+     if u['role']=='manager' and ((before and before['role'] not in ('team','section')) or (action in ('create','update') and role not in ('team','section'))):return self.respond(403,{'error':'Managers may manage inspectors and section heads only'})
      if action=='create':
       if before:return self.respond(409,{'error':'Username already exists'})
-      if role not in ('team','manager','admin') or not isinstance(pw,str) or not 12<=len(pw)<=256:return self.respond(400,{'error':'Valid role and password of 12–256 characters required'})
+      if role not in ('team','section','manager','admin') or not isinstance(pw,str) or not 12<=len(pw)<=256:return self.respond(400,{'error':'Valid role and password of 12–256 characters required'})
       salt=secrets.token_hex(16); c.execute('INSERT INTO users(username,salt,hash,role) VALUES(?,?,?,?)',(name,salt,password(pw,salt),role))
      elif not before:return self.respond(404,{'error':'User not found'})
      elif action=='update':
       active=d.get('active');
-      if role not in ('team','manager','admin') or type(active) is not bool:return self.respond(400,{'error':'Valid role and account status required'})
+      if role not in ('team','section','manager','admin') or type(active) is not bool:return self.respond(400,{'error':'Valid role and account status required'})
       if name==u['username'] and (role!='admin' or not active):return self.respond(400,{'error':'You cannot demote or deactivate your own account'})
       c.execute('UPDATE users SET role=?,active=? WHERE username=?',(role,int(active),name)); c.execute('DELETE FROM sessions WHERE username=? AND username<>?',(name,u['username']))
      elif action=='reset':
@@ -96,17 +99,25 @@ class Handler(BaseHTTPRequestHandler):
      else:return self.respond(400,{'error':'Unknown action'})
      after=c.execute('SELECT username,role,active FROM users WHERE username=?',(name,)).fetchone(); c.execute('INSERT INTO audit(at,actor,action,record_id,before_value,after_value,reason) VALUES(?,?,?,?,?,?,?)',(now(),u['username'],'user_'+action,name,json.dumps(dict(before)) if before else None,json.dumps(dict(after)),reason)); c.commit(); return self.respond(200,{'ok':True})
     reason=str(d.get('reason','')).strip(); rid=str(d.get('id','')); old=c.execute('SELECT * FROM inspections WHERE id=?',(rid,)).fetchone()
-    if self.path not in ('/api/save','/api/delete'):return self.respond(404,{'error':'Not found'})
-    if old and (u['role']=='team' or not reason):return self.respond(403,{'error':'Manager or admin and correction reason required'})
+    if self.path not in ('/api/save','/api/delete','/api/verify'):return self.respond(404,{'error':'Not found'})
+    if self.path=='/api/verify' and u['role']=='team':return self.respond(403,{'error':'Section head, manager or admin required'})
+    if old and (not reason or (u['role']=='team' and (old['owner']!=u['username'] or json.loads(old['payload']).get('verified_at')))):return self.respond(403,{'error':'Correction reason required; inspectors may change only their own unverified records'})
     if old and (old['deleted'] or d.get('version')!=old['version']):return self.respond(409,{'error':'Record changed; refresh before retrying'})
-    if self.path=='/api/delete':
+    if self.path=='/api/verify':
+     if not old:return self.respond(404,{'error':'Record not found'})
+     r=json.loads(old['payload'])
+     if r.get('verified_at'):return self.respond(409,{'error':'Already verified'})
+     if any(p['assessment']=='Pending' or not p['result'].strip() for p in r['params']):return self.respond(400,{'error':'Complete every result before verification'})
+     r['verified_at']=now(); r['verified_by']=u['username']; after=json.dumps(r,ensure_ascii=False); action='verify'
+     c.execute('UPDATE inspections SET payload=?,version=version+1 WHERE id=?',(after,rid))
+    elif self.path=='/api/delete':
      if not old:return self.respond(404,{'error':'Record not found'})
      c.execute('UPDATE inspections SET deleted=1,version=version+1 WHERE id=?',(rid,)); after=None; action='soft_delete'
     else:
      r=d['record']; keys=['product','fg','batch','mfg','date','stage','analyst','remarks']; r={**{k:str(r.get(k,''))[:2000] for k in keys},'params':r['params']}; assert r['product'] and r['batch'] and r['date'] and r['stage'] in STAGES; assert 0<len(r['params'])<=500
      for p in r['params']:
       assert all(isinstance(p.get(k),str) for k in ('name','spec','unit','result','assessment')) and p['name'] and p['spec'] and p['assessment'] in ('Pass','Fail','Pending') and (p['assessment']=='Pending' or p['result'].strip())
-     r['analyst']=json.loads(old['payload'])['analyst'] if old else u['username']; rid=rid if old else str(uuid.uuid4()); r['id']=rid; after=json.dumps(r,ensure_ascii=False); action='correct' if old else 'create'
+     r['params']=[{k:p[k] for k in ('name','spec','unit','result','assessment')} for p in r['params']]; r['analyst']=json.loads(old['payload'])['analyst'] if old else u['username']; rid=rid if old else str(uuid.uuid4()); r['id']=rid; after=json.dumps(r,ensure_ascii=False); action='correct' if old else 'create'
      if old:c.execute('UPDATE inspections SET payload=?,version=version+1 WHERE id=?',(after,rid))
      else:c.execute('INSERT INTO inspections(id,owner,version,payload,deleted) VALUES(?,?,1,?,0)',(rid,u['username'],after))
     c.execute('INSERT INTO audit(at,actor,action,record_id,before_value,after_value,reason) VALUES(?,?,?,?,?,?,?)',(now(),u['username'],action,rid,old['payload'] if old else None,after,reason)); c.commit(); return self.respond(200,{'ok':True})
